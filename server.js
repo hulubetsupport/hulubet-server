@@ -1,8 +1,17 @@
+/**
+ * ============================================================================
+ * 🦁 HULU BET - 10K+ CCU PRODUCTION SERVER ENGINE (server.js)
+ * Official Bot: @Hulubetethbot | Official Channel: @HuluBetOfficial
+ * Official Agents: @Agent1hulubet | @Agent2hulubet
+ * ============================================================================
+ */
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -12,21 +21,23 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.use(cors());
 app.use(express.json());
 
-// 🗄️ Clean Connection String & Safe SSL
+// 🗄️ PostgreSQL Connection Pool (Scalable for 10k users)
 let dbUrl = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_feXPgp4B8Wkh@ep-shy-rain-b5qmdt68-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require";
 dbUrl = dbUrl.replace('&channel_binding=require', '').replace('?channel_binding=require', '');
 
 const pool = new Pool({
   connectionString: dbUrl,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 30, // 30 concurrent DB connections
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
 });
 
-// Database Connection Test on Startup
 pool.connect((err, client, release) => {
   if (err) {
     console.error('❌ Database Connection Error:', err.message);
   } else {
-    console.log('✅ Connected to Neon PostgreSQL Database successfully!');
+    console.log('✅ Connected to Hulu Bet PostgreSQL Core Database!');
     release();
   }
 });
@@ -48,13 +59,14 @@ const CONFIG = {
 };
 
 // ============================================================================
-// 👥 1. USER AUTH & INIT
+// 👥 1. USER AUTH & BALANCE INITIALIZATION
 // ============================================================================
 app.get('/api/user/init', async (req, res) => {
   const { userId, username, name, refId } = req.query;
   const cleanId = String(userId || 'guest_101').trim();
   const cleanUser = String(username || 'player').trim();
   const cleanName = String(name || 'Player').trim();
+  const cleanRef = String(refId || '').trim();
 
   try {
     const existing = await pool.query('SELECT * FROM users WHERE user_id = $1', [cleanId]);
@@ -68,16 +80,22 @@ app.get('/api/user/init', async (req, res) => {
         name: u.full_name,
         balance: parseFloat(u.balance),
         bonusBalance: parseFloat(u.bonus_balance),
+        totalDeposited: parseFloat(u.total_deposited),
+        firstDepositCompleted: u.first_deposit_completed,
+        wagerRequirementLeft: parseFloat(u.wager_requirement_left),
         role: u.role,
         status: u.status
       });
     }
 
-    const initialWagerReq = CONFIG.WELCOME_BONUS * CONFIG.WAGER_REQ_MULT;
+    // New User Signup: 20 ETB Welcome Bonus
+    const finalRef = (cleanRef && cleanRef !== cleanId) ? cleanRef : '';
+    const initialWagerReq = Number((CONFIG.WELCOME_BONUS * CONFIG.WAGER_REQ_MULT).toFixed(2));
+
     await pool.query(`
       INSERT INTO users (user_id, telegram_username, full_name, balance, bonus_balance, wager_requirement_left, referrer_id)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
-    `, [cleanId, cleanUser, cleanName, CONFIG.WELCOME_BONUS, CONFIG.WELCOME_BONUS, initialWagerReq, refId || '']);
+    `, [cleanId, cleanUser, cleanName, CONFIG.WELCOME_BONUS, CONFIG.WELCOME_BONUS, initialWagerReq, finalRef]);
 
     await pool.query(`UPDATE casino_vault SET total_bonus_awarded = total_bonus_awarded + $1 WHERE id = 1`, [CONFIG.WELCOME_BONUS]);
 
@@ -89,6 +107,9 @@ app.get('/api/user/init', async (req, res) => {
       name: cleanName,
       balance: CONFIG.WELCOME_BONUS,
       bonusBalance: CONFIG.WELCOME_BONUS,
+      totalDeposited: 0.00,
+      firstDepositCompleted: 'NO',
+      wagerRequirementLeft: initialWagerReq,
       role: 'Player',
       status: 'Active'
     });
@@ -98,12 +119,12 @@ app.get('/api/user/init', async (req, res) => {
 });
 
 // ============================================================================
-// 🎰 2. 85% SMART RTP CASINO ENGINE
+// 🎰 2. 85% SMART RTP CASINO ENGINE (With Atomic Lock)
 // ============================================================================
 app.post('/api/bet/play', async (req, res) => {
   const { userId, gameName, betAmount, clientData } = req.body;
   const cleanId = String(userId).trim();
-  const wager = Number(betAmount);
+  const wager = Math.round(Number(betAmount) * 100) / 100;
 
   if (isNaN(wager) || wager <= 0 || wager > CONFIG.MAX_BET) {
     return res.json({ success: false, message: `Bet must be between 1 and ${CONFIG.MAX_BET} ETB!` });
@@ -113,6 +134,7 @@ app.post('/api/bet/play', async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // 1. Lock user row for update (Atomic Race-Condition Protection)
     const userRes = await client.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [cleanId]);
     if (userRes.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -127,10 +149,12 @@ app.post('/api/bet/play', async (req, res) => {
       return res.json({ success: false, message: 'Insufficient balance!' });
     }
 
+    // 2. Read Vault Safety Buffer
     const vaultRes = await client.query('SELECT * FROM casino_vault WHERE id = 1 FOR UPDATE');
     const vault = vaultRes.rows[0];
     const isBufferSafe = parseFloat(vault.vault_balance) >= CONFIG.SAFETY_BUFFER;
 
+    // 3. Smart Multi-Tier RNG Roll (85% Model)
     const rngRoll = Number((Math.random() * 100).toFixed(2));
     let multiplier = 0.0;
     let tierApplied = "Tier 0 (Early Loss)";
@@ -150,42 +174,55 @@ app.post('/api/bet/play', async (req, res) => {
         tierApplied = "Tier 3 (Mega Rocket / 6%)";
       } else {
         multiplier = 2.50;
-        tierApplied = "Tier 3 (Protected)";
+        tierApplied = "Tier 3 (Protected Cap)";
       }
     }
 
-    let payout = Number((wager * multiplier).toFixed(2));
+    let payout = Math.round(Number(wager * multiplier) * 100) / 100;
     if (payout > CONFIG.MAX_PAYOUT) {
       payout = CONFIG.MAX_PAYOUT;
       multiplier = Number((payout / wager).toFixed(2));
     }
 
     const isWin = payout > 0;
-    const netHouseProfit = Number((wager - payout).toFixed(2));
-    const newBal = Number((currentBal - wager + payout).toFixed(2));
-    const newWagerReq = Math.max(0, parseFloat(user.wager_requirement_left) - wager);
+    const netHouseProfit = Math.round(Number(wager - payout) * 100) / 100;
+    const newBal = Math.round(Number(currentBal - wager + payout) * 100) / 100;
+    const newWagerReq = Math.max(0, Math.round(Number(parseFloat(user.wager_requirement_left) - wager) * 100) / 100);
 
+    // 4. Update User
     await client.query(`
       UPDATE users 
       SET balance = $1, total_wagered = total_wagered + $2, total_won = total_won + $3, wager_requirement_left = $4, last_active_at = NOW()
       WHERE user_id = $5
     `, [newBal, wager, payout, newWagerReq, cleanId]);
 
+    // 5. Update Vault
     await client.query(`
       UPDATE casino_vault 
       SET vault_balance = vault_balance + $1, total_wagered = total_wagered + $2, total_payouts = total_payouts + $3, gross_profit = gross_profit + $1, updated_at = NOW()
       WHERE id = 1
     `, [netHouseProfit, wager, payout]);
 
+    // 6. Map Visual Outcome
     const visualOutcome = mapVisualOutcome(gameName, multiplier, clientData || {});
     const betId = "BET-" + Math.floor(100000 + Math.random() * 900000);
+    const serverSeedHash = crypto.createHash('sha256').update(betId + rngRoll).digest('hex').substring(0, 16);
 
     await client.query(`
-      INSERT INTO universal_bets (bet_id, game_name, user_id, username, bet_amount, rng_roll, tier_applied, multiplier, payout, house_profit, status, game_data)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-    `, [betId, gameName, cleanId, user.telegram_username, wager, rngRoll, tierApplied, multiplier, payout, netHouseProfit, isWin ? 'WON' : 'LOST', JSON.stringify(visualOutcome)]);
+      INSERT INTO universal_bets (bet_id, game_name, user_id, username, bet_amount, rng_roll, tier_applied, multiplier, payout, house_profit, status, game_data, server_seed_hash)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `, [betId, gameName, cleanId, user.telegram_username, wager, rngRoll, tierApplied, multiplier, payout, netHouseProfit, isWin ? 'WON' : 'LOST', JSON.stringify(visualOutcome), serverSeedHash]);
 
     await client.query('COMMIT');
+
+    // Broadcast big wins via WebSockets
+    if (payout >= 500) {
+      io.emit('live_win', {
+        user: user.telegram_username.slice(0, 2) + '***' + user.telegram_username.slice(-1),
+        game: gameName,
+        win: payout
+      });
+    }
 
     return res.json({
       success: true,
@@ -216,13 +253,14 @@ function mapVisualOutcome(gameName, multiplier, clientData) {
     return { crashPoint: multiplier === 0 ? Number((1.00 + Math.random() * 0.12).toFixed(2)) : multiplier };
   }
   if (gameName === "ChickenRoad2") {
-    return { maxSafeStep: multiplier > 3.0 ? 8 : multiplier > 1.5 ? 5 : multiplier > 1.0 ? 3 : 0 };
+    const diff = clientData.difficulty || "Easy";
+    return { maxSafeStep: diff === "Easy" ? (multiplier > 1.2 ? 8 : 4) : diff === "Medium" ? (multiplier > 2.0 ? 6 : 3) : (multiplier > 3.0 ? 4 : 1) };
   }
   if (gameName === "Slot777") {
     return multiplier >= 25.0 ? { reels: ["🎰", "🎰", "🎰"], payline: "JACKPOT", colMult: 5 } : multiplier >= 2.0 ? { reels: ["🔔", "🔔", "🔔"], payline: "BELLS", colMult: 1 } : { reels: ["🎰", "🎰", "🍒"], payline: "NONE", colMult: 1 };
   }
   if (gameName === "AviaMasters") {
-    return { safeLanding: multiplier > 0, targetMultiplier: multiplier };
+    return { safeLanding: multiplier > 0, targetMultiplier: multiplier, rocketsAvoided: multiplier > 2.0 ? 3 : 1 };
   }
   return {};
 }
@@ -233,12 +271,17 @@ function mapVisualOutcome(gameName, multiplier, clientData) {
 app.post('/api/cashier/deposit', async (req, res) => {
   const { userId, username, amount, method, agentAssigned } = req.body;
   const depId = 'DEP-' + Math.floor(10000 + Math.random() * 90000);
+  const amt = Math.round(Number(amount) * 100) / 100;
+
+  if (amt < CONFIG.MIN_DEP || amt > CONFIG.MAX_DEP) {
+    return res.json({ success: false, message: `Deposit must be between ${CONFIG.MIN_DEP} and ${CONFIG.MAX_DEP} ETB!` });
+  }
 
   try {
     await pool.query(`
       INSERT INTO transactions (txn_id, user_id, username, type, method, amount, net_amount, agent_assigned, status, remarks)
       VALUES ($1, $2, $3, 'DEPOSIT', $4, $5, $5, $6, 'PENDING', 'Pending agent verification')
-    `, [depId, String(userId).trim(), username || 'player', method || 'Telebirr', Number(amount), agentAssigned || 'agent_aymen_keno']);
+    `, [depId, String(userId).trim(), username || 'player', method || 'Telebirr', amt, agentAssigned || 'Agent1hulubet']);
 
     res.json({ success: true, txnId: depId });
   } catch (err) {
@@ -249,24 +292,40 @@ app.post('/api/cashier/deposit', async (req, res) => {
 app.post('/api/cashier/withdraw', async (req, res) => {
   const { userId, amount, accountNumber, method } = req.body;
   const cleanId = String(userId).trim();
-  const amt = Number(amount);
+  const amt = Math.round(Number(amount) * 100) / 100;
 
-  if (amt < CONFIG.MIN_WTH) return res.json({ success: false, message: `Min withdrawal is ${CONFIG.MIN_WTH} ETB!` });
+  if (amt < CONFIG.MIN_WTH || amt > CONFIG.MAX_WTH) {
+    return res.json({ success: false, message: `Withdrawal must be between ${CONFIG.MIN_WTH} and ${CONFIG.MAX_WTH} ETB!` });
+  }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const uRes = await client.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [cleanId]);
-    if (uRes.rows.length === 0) { await client.query('ROLLBACK'); return res.json({ success: false, message: 'User not found!' }); }
-
-    const u = uRes.rows[0];
-    if (parseFloat(u.balance) < amt) { await client.query('ROLLBACK'); return res.json({ success: false, message: 'Insufficient balance!' }); }
-    if (u.first_deposit_completed !== 'YES' && parseFloat(u.total_deposited) < CONFIG.MIN_FIRST_DEP) {
+    if (uRes.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.json({ success: false, message: `Deposit ${CONFIG.MIN_FIRST_DEP} ETB first to unlock withdrawals!` });
+      return res.json({ success: false, message: 'User not found!' });
     }
 
-    const newBal = Number((parseFloat(u.balance) - amt).toFixed(2));
+    const u = uRes.rows[0];
+    if (parseFloat(u.balance) < amt) {
+      await client.query('ROLLBACK');
+      return res.json({ success: false, message: 'Insufficient balance!' });
+    }
+
+    // 🛡️ Gate 1: First Deposit Lock
+    if (u.first_deposit_completed !== 'YES' && parseFloat(u.total_deposited) < CONFIG.MIN_FIRST_DEP) {
+      await client.query('ROLLBACK');
+      return res.json({ success: false, message: `Deposit at least ${CONFIG.MIN_FIRST_DEP} ETB first to unlock withdrawals!` });
+    }
+
+    // 🛡️ Gate 2: Wagering Requirement Lock
+    if (parseFloat(u.wager_requirement_left) > 0) {
+      await client.query('ROLLBACK');
+      return res.json({ success: false, message: `Wager requirement active: ${parseFloat(u.wager_requirement_left).toFixed(2)} ETB remaining!` });
+    }
+
+    const newBal = Math.round(Number(parseFloat(u.balance) - amt) * 100) / 100;
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [newBal, cleanId]);
 
     const wthId = 'WTH-' + Math.floor(10000 + Math.random() * 90000);
@@ -285,7 +344,74 @@ app.post('/api/cashier/withdraw', async (req, res) => {
   }
 });
 
-// 👥 Live Agents Endpoint
+// 1-Click Top-Up & Approval with Fraud Guard
+app.post('/api/admin/topup', async (req, res) => {
+  const { pin, userId, amount, txnId, actor } = req.body;
+  if (pin !== CONFIG.ADMIN_PIN) return res.json({ success: false, message: 'Invalid Admin PIN!' });
+
+  const cleanId = String(userId).trim();
+  const amt = Math.round(Number(amount) * 100) / 100;
+  const cleanTxnRef = String(txnId || '').trim();
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    
+    // Duplicate Screenshot / Txn ID Blocker
+    if (cleanTxnRef !== '') {
+      const dup = await client.query("SELECT * FROM transactions WHERE bank_txn_id = $1 AND status = 'APPROVED'", [cleanTxnRef]);
+      if (dup.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.json({ success: false, message: '⚠️ FRAUD ALERT: This Transaction ID was already credited!' });
+      }
+    }
+
+    let uRes = await client.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [cleanId]);
+    let u;
+    if (uRes.rows.length === 0) {
+      await client.query(`INSERT INTO users (user_id, telegram_username, full_name, balance, total_deposited, first_deposit_completed) VALUES ($1, $2, 'New Player', $3, $3, 'YES')`, [cleanId, 'player_' + cleanId.slice(-4), amt]);
+    } else {
+      u = uRes.rows[0];
+      await client.query(`UPDATE users SET balance = balance + $1, total_deposited = total_deposited + $1, first_deposit_completed = 'YES' WHERE user_id = $2`, [amt, cleanId]);
+
+      // 🎁 50 ETB Referral Bonus
+      if (u.first_deposit_completed !== 'YES' && u.referrer_id && u.referrer_id !== cleanId && amt >= CONFIG.MIN_FIRST_DEP) {
+        const refWagerReq = CONFIG.REFERRAL_BONUS * 2;
+        await client.query(`
+          UPDATE users 
+          SET balance = balance + $1, referral_earnings = referral_earnings + $1, invited_count = invited_count + 1, wager_requirement_left = wager_requirement_left + $2 
+          WHERE user_id = $3
+        `, [CONFIG.REFERRAL_BONUS, refWagerReq, u.referrer_id]);
+
+        await client.query(`UPDATE casino_vault SET total_bonus_awarded = total_bonus_awarded + $1 WHERE id = 1`, [CONFIG.REFERRAL_BONUS]);
+      }
+    }
+
+    // 👔 2% Agent Commission Ledger
+    const commAmt = Math.round(Number(amt * 0.02) * 100) / 100;
+    await client.query(`
+      UPDATE agents 
+      SET total_deposits_processed = total_deposits_processed + $1, total_commission_earned = total_commission_earned + $2 
+      WHERE telegram_username ILIKE $3 OR agent_id = $3
+    `, [amt, commAmt, actor || 'Agent1hulubet']);
+
+    const depId = 'DEP-' + Math.floor(10000 + Math.random() * 90000);
+    await client.query(`
+      INSERT INTO transactions (txn_id, user_id, username, type, method, amount, net_amount, bank_txn_id, status, processed_by)
+      VALUES ($1, $2, $3, 'DEPOSIT', 'Manual_1Click', $4, $4, $5, 'APPROVED', $6)
+    `, [depId, cleanId, u ? u.telegram_username : 'player', amt, cleanTxnRef, actor || 'Agent']);
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: `Successfully credited ${amt} ETB to Player ${cleanId}!` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Live Agents Endpoint
 app.get('/api/agents', async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM agents');
@@ -296,4 +422,4 @@ app.get('/api/agents', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Hulu Bet Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Hulu Bet 10k CCU Server running on port ${PORT}`));
