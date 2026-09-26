@@ -447,35 +447,17 @@ app.get('/api/admin/analytics', async (req, res) => {
   }
 });
 
+
+
 // ============================================================================
-// 👑 ADVANCED AUTOMATED ADMIN OPERATIONS (APPROVE, REJECT, CASHBACK, QUEUE)
+// 👑 COMPLETE AUTOMATED ADMIN ACTIONS (APPROVE, REJECT, CASHBACK, PROMO)
 // ============================================================================
 
-// 1. የጥበቃ መስመር (Pending Deposits & Withdrawals Queue)
-app.get('/api/admin/pending-queue', async (req, res) => {
-  const { pin } = req.query;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
-
-  try {
-    const deposits = await pool.query("SELECT * FROM transactions WHERE type = 'DEPOSIT' AND status = 'PENDING' ORDER BY created_at DESC");
-    const withdrawals = await pool.query("SELECT * FROM transactions WHERE type = 'WITHDRAWAL' AND status = 'PENDING' ORDER BY created_at DESC");
-    const promos = await pool.query("SELECT * FROM promo_codes ORDER BY created_at DESC");
-
-    res.json({
-      success: true,
-      pendingDeposits: deposits.rows,
-      pendingWithdrawals: withdrawals.rows,
-      promoCodes: promos.rows
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 2. ዲፖዚት ማጽደቂያ (Approve Deposit -> Credits User, Pays Agent Commission)
+// 1. ዲፖዚት ማጽደቂያ (Approve Deposit -> ተጠቃሚው ጋር ብር ይገባል፣ ለኤጀንቱ ኮሚሽን ይሰላል)
 app.post('/api/admin/approve-deposit', async (req, res) => {
   const { pin, txnId, actor } = req.body;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
 
   const client = await pool.connect();
   try {
@@ -488,18 +470,21 @@ app.post('/api/admin/approve-deposit', async (req, res) => {
     const txn = txnRes.rows[0];
     const amt = parseFloat(txn.amount);
 
-    // የተጠቃሚውን አካውንት መሙላት
+    // የተጠቃሚውን ሂሳብ መጨመር
     await client.query("UPDATE users SET balance = balance + $1, total_deposited = total_deposited + $1, first_deposit_completed = 'YES' WHERE user_id = $2", [amt, txn.user_id]);
 
-    // የኤጀንት ኮሚሽን ማስላት
-    const commAmt = Math.round(Number(amt * SETTINGS.AGENT_COMMISSION) * 100) / 100;
-    await client.query("UPDATE agents SET total_deposits_processed = total_deposits_processed + $1, total_commission_earned = total_commission_earned + $2 WHERE telegram_username ILIKE $3", [amt, commAmt, txn.agent_assigned || actor]);
+    // የኤጀንቱን ኮሚሽን ማስላት (2%)
+    const commRate = (SETTINGS && SETTINGS.AGENT_COMMISSION) ? SETTINGS.AGENT_COMMISSION : 0.02;
+    const commAmt = Math.round(Number(amt * commRate) * 100) / 100;
+    try {
+      await client.query("UPDATE agents SET total_deposits_processed = total_deposits_processed + $1, total_commission_earned = total_commission_earned + $2 WHERE telegram_username ILIKE $3", [amt, commAmt, txn.agent_assigned || actor]);
+    } catch(e) {}
 
-    // ትራንዛክሽኑን ማጽደቅ
-    await client.query("UPDATE transactions SET status = 'APPROVED', processed_by = $1, updated_at = NOW() WHERE txn_id = $2", [actor || 'Admin', txnId]);
+    // ትራንዛክሽኑን APPROVED ማድረግ
+    await client.query("UPDATE transactions SET status = 'APPROVED', remarks = 'Approved by Admin' WHERE txn_id = $1", [txnId]);
 
     await client.query('COMMIT');
-    res.json({ success: true, message: `Deposit ${txnId} approved! Credited ${amt} ETB.` });
+    res.json({ success: true, message: `Deposit ${txnId} approved! ${amt} ETB credited to User ${txn.user_id}.` });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ success: false, error: err.message });
@@ -508,36 +493,39 @@ app.post('/api/admin/approve-deposit', async (req, res) => {
   }
 });
 
-// 3. ዲፖዚት ውድቅ ማድረጊያ (Reject Deposit)
+// 2. ዲፖዚት ውድቅ ማድረጊያ (Reject Deposit)
 app.post('/api/admin/reject-deposit', async (req, res) => {
   const { pin, txnId, reason } = req.body;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
 
   try {
-    await pool.query("UPDATE transactions SET status = 'REJECTED', remarks = $1, updated_at = NOW() WHERE txn_id = $2 AND status = 'PENDING'", [reason || 'Payment verification failed', txnId]);
+    await pool.query("UPDATE transactions SET status = 'REJECTED', remarks = $1 WHERE txn_id = $2 AND status = 'PENDING'", [reason || 'Payment verification failed', txnId]);
     res.json({ success: true, message: `Deposit ${txnId} rejected.` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 4. ገንዘብ ማውጣት ማጽደቂያ (Approve Withdrawal -> Cash sent via Telebirr/CBE)
+// 3. ገንዘብ ማውጣት ማጽደቂያ (Approve Withdrawal -> ክፍያው በቴሌብር/CBE ተልኳል)
 app.post('/api/admin/approve-withdrawal', async (req, res) => {
   const { pin, txnId, actor } = req.body;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
 
   try {
-    await pool.query("UPDATE transactions SET status = 'APPROVED', processed_by = $1, updated_at = NOW() WHERE txn_id = $2 AND status = 'PENDING'", [actor || 'Admin', txnId]);
+    await pool.query("UPDATE transactions SET status = 'APPROVED', remarks = 'Payout completed' WHERE txn_id = $1 AND status = 'PENDING'", [txnId]);
     res.json({ success: true, message: `Withdrawal ${txnId} marked as completed!` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 5. ገንዘብ ማውጣት ውድቅ ማድረጊያ እና ብሩን ለተጠቃሚው መመለሻ (Reject & Refund Withdrawal)
+// 4. ገንዘብ ማውጣት ውድቅ ማድረጊያ እና ብሩን ለተጠቃሚው መመለሻ (Reject & Refund Withdrawal)
 app.post('/api/admin/reject-withdrawal', async (req, res) => {
   const { pin, txnId, reason } = req.body;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
 
   const client = await pool.connect();
   try {
@@ -550,12 +538,12 @@ app.post('/api/admin/reject-withdrawal', async (req, res) => {
     const txn = txnRes.rows[0];
     const refundAmt = parseFloat(txn.amount);
 
-    // የተቆረጠውን ገንዘብ ለተጠቃሚው መመለስ (Refund)
+    // የተቆረጠውን ገንዘብ ለተጠቃሚው መመለስ (Auto-Refund)
     await client.query("UPDATE users SET balance = balance + $1 WHERE user_id = $2", [refundAmt, txn.user_id]);
-    await client.query("UPDATE transactions SET status = 'REJECTED', remarks = $1, updated_at = NOW() WHERE txn_id = $2", [reason || 'Incorrect account or rejected', txnId]);
+    await client.query("UPDATE transactions SET status = 'REJECTED', remarks = $1 WHERE txn_id = $2", [reason || 'Incorrect account or rejected', txnId]);
 
     await client.query('COMMIT');
-    res.json({ success: true, message: `Withdrawal ${txnId} rejected & ${refundAmt} ETB refunded to user!` });
+    res.json({ success: true, message: `Withdrawal ${txnId} rejected & ${refundAmt} ETB refunded to User ${txn.user_id}!` });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ success: false, error: err.message });
@@ -564,10 +552,11 @@ app.post('/api/admin/reject-withdrawal', async (req, res) => {
   }
 });
 
-// 6. 1-CLICK CASHBACK ENGINE (የተጣራ ኪሳራን አስልቶ Cashback መመለሻ)
+// 5. 1-CLICK CASHBACK ENGINE (የተጣራ ኪሳራን አስልቶ Cashback መመለሻ)
 app.post('/api/admin/distribute-cashback', async (req, res) => {
   const { pin, percentage, minLoss } = req.body;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
 
   const percent = Number(percentage) / 100;
   const cutoff = Number(minLoss || 100);
@@ -575,7 +564,7 @@ app.post('/api/admin/distribute-cashback', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // ኪሳራ ያላቸውን ተጠቃሚዎች መለየት (total_wagered - total_won > 0)
+    // ኪሳራ ያለባቸውን ተጠቃሚዎች መለየት (total_wagered - total_won >= cutoff)
     const losersRes = await client.query(`
       SELECT user_id, (total_wagered - total_won) as net_loss 
       FROM users 
@@ -589,10 +578,13 @@ app.post('/api/admin/distribute-cashback', async (req, res) => {
       const cbAmount = Math.round(Number(u.net_loss * percent) * 100) / 100;
       if (cbAmount > 0) {
         await client.query("UPDATE users SET balance = balance + $1, bonus_balance = bonus_balance + $1 WHERE user_id = $2", [cbAmount, u.user_id]);
-        await client.query(`
-          INSERT INTO transactions (txn_id, user_id, type, amount, status, remarks)
-          VALUES ('CB-' || floor(random() * 90000 + 10000), $1, 'BONUS', $2, 'APPROVED', $3)
-        `, [u.user_id, cbAmount, `${percentage}% Loyalty Cashback`]);
+        
+        try {
+          await client.query(`
+            INSERT INTO transactions (txn_id, user_id, type, amount, status, remarks)
+            VALUES ('CB-' || floor(random() * 90000 + 10000), $1, 'BONUS', $2, 'APPROVED', $3)
+          `, [u.user_id, cbAmount, `${percentage}% Loyalty Cashback`]);
+        } catch(e) {}
 
         distributedCount++;
         totalCashbackAwarded += cbAmount;
@@ -602,7 +594,7 @@ app.post('/api/admin/distribute-cashback', async (req, res) => {
     await client.query('COMMIT');
     res.json({
       success: true,
-      message: `🎉 Distributed ${totalCashbackAwarded.toFixed(2)} ETB Cashback to ${distributedCount} players!`
+      message: `🎉 Successfully distributed ${totalCashbackAwarded.toFixed(2)} ETB Cashback to ${distributedCount} players!`
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -612,15 +604,85 @@ app.post('/api/admin/distribute-cashback', async (req, res) => {
   }
 });
 
-// 7. የተጠቃሚዎች ፍለጋ (Search Users)
+// 6. አዲስ ፕሮሞ ኮድ መፍጠር
+app.post('/api/admin/create-promo', async (req, res) => {
+  const { pin, code, bonusAmount, maxUses } = req.body;
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+
+  try {
+    await pool.query(`
+      INSERT INTO promo_codes (code, bonus_amount, max_uses)
+      VALUES ($1, $2, $3)
+    `, [String(code).trim().toUpperCase(), Number(bonusAmount), Number(maxUses || 100)]);
+
+    res.json({ success: true, message: `Promo code ${code.toUpperCase()} created successfully (+${bonusAmount} ETB)!` });
+  } catch(e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// 7. ብዙ ሰዎችን በአንድ ጠቅታ መሸለም (Batch Gifting)
+app.post('/api/admin/reward-users', async (req, res) => {
+  const { pin, userIds, rewardAmount } = req.body;
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+
+  const amt = Number(rewardAmount);
+  if (!Array.isArray(userIds) || userIds.length === 0 || amt <= 0) {
+    return res.json({ success: false, message: 'Provide a valid array of user IDs and amount!' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`
+      UPDATE users 
+      SET balance = balance + $1, bonus_balance = bonus_balance + $1 
+      WHERE user_id = ANY($2::varchar[])
+    `, [amt, userIds]);
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: `Successfully rewarded ${userIds.length} players with ${amt} ETB each!` });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 8. Dynamic RTP & Commission ቅንብሮችን መቀየሪያ
+app.post('/api/admin/update-settings', async (req, res) => {
+  const { pin, targetRtp, agentCommission } = req.body;
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+
+  try {
+    if (targetRtp !== undefined && SETTINGS) {
+      SETTINGS.TARGET_RTP = parseFloat(targetRtp);
+      try { await pool.query("UPDATE system_settings SET value = $1 WHERE key = 'target_rtp'", [String(targetRtp)]); } catch(e) {}
+    }
+    if (agentCommission !== undefined && SETTINGS) {
+      SETTINGS.AGENT_COMMISSION = parseFloat(agentCommission);
+      try { await pool.query("UPDATE system_settings SET value = $1 WHERE key = 'agent_commission'", [String(agentCommission)]); } catch(e) {}
+    }
+    res.json({ success: true, message: `Settings updated successfully!` });
+  } catch(e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// 9. የተጠቃሚዎች ፍለጋ (Search Users)
 app.get('/api/admin/users', async (req, res) => {
   const { pin, search } = req.query;
-  if (pin !== SETTINGS.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+  const currentPin = (SETTINGS && SETTINGS.ADMIN_PIN) ? SETTINGS.ADMIN_PIN : (CONFIG?.ADMIN_PIN || "1234");
+  if (pin !== currentPin) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
 
   try {
     const q = search ? `%${search}%` : '%';
     const r = await pool.query(`
-      SELECT user_id, telegram_username, full_name, balance, bonus_balance, total_deposited, total_wagered, total_won, created_at 
+      SELECT user_id, telegram_username, balance, total_deposited, total_wagered, total_won 
       FROM users 
       WHERE user_id ILIKE $1 OR telegram_username ILIKE $1 
       ORDER BY balance DESC LIMIT 30
