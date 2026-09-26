@@ -421,5 +421,33 @@ app.get('/api/agents', async (req, res) => {
   }
 });
 
+
+// ============================================================================
+// 📊 ADMIN LIVE ANALYTICS & TRANSACTIONS FEED
+// ============================================================================
+app.get('/api/admin/analytics', async (req, res) => {
+  const { pin } = req.query;
+  if (pin !== CONFIG.ADMIN_PIN) return res.status(403).json({ success: false, message: 'Invalid Admin PIN!' });
+
+  try {
+    const vaultRes = await pool.query('SELECT * FROM casino_vault WHERE id = 1');
+    const usersCountRes = await pool.query('SELECT COUNT(*) as total_users FROM users');
+    const recentTxnsRes = await pool.query('SELECT * FROM transactions ORDER BY created_at DESC LIMIT 20');
+    const pendingWithdrawalsRes = await pool.query("SELECT * FROM transactions WHERE type = 'WITHDRAWAL' AND status = 'PENDING'");
+
+    res.json({
+      success: true,
+      vault: vaultRes.rows[0] || {},
+      totalUsers: usersCountRes.rows[0].total_users,
+      recentTransactions: recentTxnsRes.rows,
+      pendingWithdrawals: pendingWithdrawalsRes.rows
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Hulu Bet 10k CCU Server running on port ${PORT}`));
