@@ -183,12 +183,12 @@ app.get('/api/user/init', async (req, res) => {
 });
 
 // ============================================================================
-// 🎰 2. 6-GAME CASINO ENGINE (ኪሳራን በትክክል 100% የሚቀንስ ጥብቅ የሂሳብ ቀመር)
+// 🎰 2. STRICT 6-GAME ENGINE (CRASH GAMES DEDUCT ON BET, CREDIT ONLY ON CASHOUT)
 // ============================================================================
 const VALID_GAMES = ["Aviator", "JetX", "KenoFast", "ChickenRoad2", "Slot777", "AviaMasters"];
 
 app.post('/api/bet/play', async (req, res) => {
-  const { userId, gameName, betAmount, clientData } = req.body;
+  const { userId, gameName, betAmount, clientData, initData } = req.body;
   const cleanId = String(userId || '').trim();
   const wager = Math.round(Number(betAmount) * 100) / 100;
 
@@ -203,7 +203,7 @@ app.post('/api/bet/play', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 🔒 Concurrency Protection: Row-level lock on user
+    // 🔒 Concurrency Protection: Row-level lock
     const userRes = await client.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [cleanId]);
     if (userRes.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -222,92 +222,89 @@ app.post('/api/bet/play', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Insufficient balance' });
     }
 
-    const vaultRes = await client.query('SELECT * FROM casino_vault WHERE id = 1 FOR UPDATE');
-    const vault = vaultRes.rows[0];
-    const isBufferSafe = parseFloat(vault.vault_balance) >= CONFIG.SAFETY_BUFFER;
-
-    // 🎯 Cryptographically Secure RNG Roll (0 to 100)
-    const rngRoll = secureRandomFloat() * 100;
-    let multiplier = 0.0;
-    let tierApplied = "Tier 0 (Loss)";
-
-    // በ 70% ዙሮች ላይ ተጫዋቹ ሙሉ በሙሉ ይሸነፋል (ማባዣ = 0.0)
-    if (rngRoll <= 70.0) {
-      multiplier = 0.0; // 👈 ኪሳራ፡ ማባዣ 0 ይሆናል፤ ክፍያ 0 ይሆናል!
-      tierApplied = "Tier 0 (Pure Loss / 70%)";
-    } else if (rngRoll <= 90.0) {
-      multiplier = Number((1.20 + secureRandomFloat() * 0.80).toFixed(2));
-      tierApplied = "Tier 1 (Small Win / 20%)";
-    } else if (rngRoll <= 98.0) {
-      multiplier = Number((2.20 + secureRandomFloat() * 2.80).toFixed(2));
-      tierApplied = "Tier 2 (Medium Win / 8%)";
-    } else {
-      if (isBufferSafe) {
-        multiplier = Number((6.00 + secureRandomFloat() * 14.00).toFixed(2));
-        tierApplied = "Tier 3 (Big Win / 2%)";
-      } else {
-        multiplier = 2.50;
-        tierApplied = "Tier 3 (Protected Cap)";
-      }
-    }
-
-    let payout = Math.round(Number(wager * multiplier) * 100) / 100;
-    if (payout > CONFIG.MAX_PAYOUT) {
-      payout = CONFIG.MAX_PAYOUT;
-      multiplier = Number((payout / wager).toFixed(2));
-    }
-
-    const isWin = multiplier > 0;
-    const netHouseProfit = Math.round(Number(wager - payout) * 100) / 100;
-
-    // 👉 ትክክለኛው የሂሳብ ስሌት፦
-    // ሲሸነፍ፡ newBal = currentBal - wager (ገንዘቡ 100% ይቀነሳል!)
-    // ሲያሸንፍ፡ newBal = currentBal - wager + payout (አሸናፊው ብቻ ይደመራል!)
-    const newBal = Math.round(Number(currentBal - wager + payout) * 100) / 100;
-    const newWagerReq = Math.max(0, Math.round(Number(parseFloat(user.wager_requirement_left || 0) - wager) * 100) / 100);
-
-    // Neon DB ማዘመን
-    await client.query(`
-      UPDATE users 
-      SET balance = $1, total_wagered = total_wagered + $2, total_won = total_won + $3, wager_requirement_left = $4, last_active_at = NOW()
-      WHERE user_id = $5
-    `, [newBal, wager, payout, newWagerReq, cleanId]);
-
-    await client.query(`
-      UPDATE casino_vault 
-      SET vault_balance = vault_balance + $1, total_wagered = total_wagered + $2, total_payouts = total_payouts + $3, gross_profit = gross_profit + $1, updated_at = NOW()
-      WHERE id = 1
-    `, [netHouseProfit, wager, payout]);
-
-    const visualOutcome = mapVisualOutcome(gameName, multiplier, clientData || {});
     const betId = "BET-" + crypto.randomInt(100000, 999999);
-    const serverSeedHash = crypto.createHash('sha256').update(betId + rngRoll).digest('hex').substring(0, 16);
+    const isCrashGame = (gameName === "Aviator" || gameName === "JetX" || gameName === "ChickenRoad2");
 
-    await client.query(`
-      INSERT INTO universal_bets (bet_id, game_name, user_id, username, bet_amount, rng_roll, tier_applied, multiplier, payout, house_profit, status, game_data, server_seed_hash)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-    `, [betId, gameName, cleanId, user.telegram_username, wager, rngRoll, tierApplied, multiplier, payout, netHouseProfit, isWin ? 'WON' : 'LOST', JSON.stringify(visualOutcome), serverSeedHash]);
+    // ========================================================================
+    // A. አቪዬተር፣ ጄትኤክስ እና ቺከን ሮድ (ገንዘቡን ወዲያውኑ ከዳታቤዝ የመቀነስ ህግ)
+    // ========================================================================
+    if (isCrashGame) {
+      // 1. ገንዘቡን በቅጽበት ከዳታቤዝ መቀነስ (Deduct Wager Instantly)
+      const newBal = Math.round(Number(currentBal - wager) * 100) / 100;
+      await client.query("UPDATE users SET balance = $1, total_wagered = total_wagered + $2 WHERE user_id = $3", [newBal, wager, cleanId]);
 
-    await recordAuditLog(client, cleanId, isWin ? 'WIN' : 'BET_LOSS', isWin ? payout : wager, currentBal, newBal, betId);
+      // 2. የፍንዳታ ነጥቡን (Crash Point) በዘፈቀደ ማመንጨት (65% ቀድሞ ይፈነዳል)
+      const crashRoll = secureRandomFloat() * 100;
+      let crashPoint = 1.05;
+      if (crashRoll <= 65.0) {
+        crashPoint = Number((1.01 + secureRandomFloat() * 0.35).toFixed(2)); // 1.01x - 1.36x
+      } else if (crashRoll <= 90.0) {
+        crashPoint = Number((1.37 + secureRandomFloat() * 1.63).toFixed(2)); // 1.37x - 3.00x
+      } else {
+        crashPoint = Number((3.01 + secureRandomFloat() * 15.00).toFixed(2)); // 3.01x - 18.00x
+      }
 
-    await client.query('COMMIT');
+      // 3. ውርርዱን በ IN_FLIGHT መመዝገብ (ትርፍ ገና አልተሰጠም!)
+      await client.query(`
+        INSERT INTO universal_bets (bet_id, game_name, user_id, username, bet_amount, multiplier, payout, house_profit, status, game_data)
+        VALUES ($1, $2, $3, $4, $5, 0, 0, $6, 'IN_FLIGHT', $7)
+      `, [betId, gameName, cleanId, user.telegram_username, wager, wager, JSON.stringify({ crashPoint })]);
 
-    if (payout >= 500) {
-      io.emit('live_win', {
-        user: (user.telegram_username ? user.telegram_username.slice(0, 2) + '***' : 'User***'),
-        game: gameName,
-        win: payout
+      await recordAuditLog(client, cleanId, 'BET_TAKEOFF', wager, currentBal, newBal, betId);
+      await client.query('COMMIT');
+
+      // ለጨዋታው የተቀነሰውን አዲሱን Balance ብቻ እንልካለን
+      return res.json({
+        success: true,
+        betId: betId,
+        crashPoint: crashPoint,
+        newBalance: newBal, // 👈 1000 ብሩ የተቀነሰበት ትክክለኛ ሂሳብ
+        visualOutcome: { crashPoint, maxSafeStep: crashPoint > 2.0 ? 5 : 2 }
       });
     }
 
+    // ========================================================================
+    // B. ፈጣን ጨዋታዎች (ኬኖ፣ ስሎት፣ አቪያ ማስተርስ)
+    // ========================================================================
+    const rngRoll = secureRandomFloat() * 100;
+    let multiplier = 0.0;
+
+    if (rngRoll <= 70.0) {
+      multiplier = 0.0; // 70% ኪሳራ
+    } else if (rngRoll <= 90.0) {
+      multiplier = Number((1.20 + secureRandomFloat() * 0.80).toFixed(2));
+    } else if (rngRoll <= 98.0) {
+      multiplier = Number((2.20 + secureRandomFloat() * 2.80).toFixed(2));
+    } else {
+      multiplier = Number((5.00 + secureRandomFloat() * 10.00).toFixed(2));
+    }
+
+    let payout = Math.round(Number(wager * multiplier) * 100) / 100;
+    if (payout > CONFIG.MAX_PAYOUT) payout = CONFIG.MAX_PAYOUT;
+
+    const isWin = multiplier > 0;
+    const newBal = Math.round(Number(currentBal - wager + payout) * 100) / 100;
+
+    await client.query(`UPDATE users SET balance = $1, total_wagered = total_wagered + $2, total_won = total_won + $3 WHERE user_id = $4`, [newBal, wager, payout, cleanId]);
+    await client.query(`UPDATE casino_vault SET vault_balance = vault_balance + $1, total_wagered = total_wagered + $2, total_payouts = total_payouts + $3 WHERE id = 1`, [wager - payout, wager, payout]);
+
+    const visualOutcome = mapVisualOutcome(gameName, multiplier, clientData || {});
+    await client.query(`
+      INSERT INTO universal_bets (bet_id, game_name, user_id, username, bet_amount, multiplier, payout, house_profit, status, game_data)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `, [betId, gameName, cleanId, user.telegram_username, wager, multiplier, payout, wager - payout, isWin ? 'WON' : 'LOST', JSON.stringify(visualOutcome)]);
+
+    await recordAuditLog(client, cleanId, isWin ? 'WIN' : 'BET_LOSS', isWin ? payout : wager, currentBal, newBal, betId);
+    await client.query('COMMIT');
+
     return res.json({
       success: true,
-      betId,
-      multiplier,
-      payout,
-      isWin,
-      newBalance: newBal, // 👈 የመደበው ገንዘብ በትክክል የተቀነሰበት Balance
-      visualOutcome
+      betId: betId,
+      multiplier: multiplier,
+      payout: payout,
+      isWin: isWin,
+      newBalance: newBal,
+      visualOutcome: visualOutcome
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -317,37 +314,69 @@ app.post('/api/bet/play', async (req, res) => {
   }
 });
 
-function mapVisualOutcome(gameName, multiplier, clientData) {
-  const isLoss = multiplier === 0;
+// ============================================================================
+// 💰 ተጫዋቹ በአቪዬተርና ጄትኤክስ በእጁ "CASH OUT" ሲነካ ብቻ ትርፍ መክፈያ API
+// ============================================================================
+app.post('/api/bet/cashout', async (req, res) => {
+  const { userId, betId, cashoutMultiplier } = req.body;
+  const cleanId = String(userId || '').trim();
+  const mult = Number(cashoutMultiplier);
 
-  if (gameName === "KenoFast") {
-    const userPicks = clientData?.picks || [1, 2, 3, 4, 5];
-    let targetHits = isLoss ? 0 : (multiplier >= 10.0 ? Math.min(userPicks.length, 7) : multiplier >= 2.0 ? Math.min(userPicks.length, 4) : 2);
-    const guaranteedHits = isLoss ? [] : userPicks.slice(0, targetHits);
-    const remaining = Array.from({ length: 80 }, (_, i) => i + 1).filter(n => !userPicks.includes(n)).sort(() => secureRandomFloat() - 0.5);
-    return { drawnNumbers: [...guaranteedHits, ...remaining.slice(0, 20 - guaranteedHits.length)].sort(() => secureRandomFloat() - 0.5), hits: targetHits };
+  if (!cleanId || !betId || isNaN(mult) || mult <= 1.0) {
+    return res.status(400).json({ success: false, message: "Invalid cashout parameters" });
   }
 
-  if (gameName === "Aviator" || gameName === "JetX") {
-    return { crashPoint: isLoss ? Number((1.01 + secureRandomFloat() * 0.12).toFixed(2)) : multiplier };
-  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const betRes = await client.query("SELECT * FROM universal_bets WHERE bet_id = $1 AND user_id = $2 FOR UPDATE", [betId, cleanId]);
+    if (betRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: "Active bet not found" });
+    }
 
-  if (gameName === "ChickenRoad2") {
-    return { maxSafeStep: isLoss ? (secureRandomFloat() < 0.6 ? 1 : 2) : (multiplier > 2.0 ? 6 : 4) };
-  }
+    const bet = betRes.rows[0];
+    if (bet.status !== 'IN_FLIGHT') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: "Bet is already closed or cashed out" });
+    }
 
-  if (gameName === "Slot777") {
-    return isLoss 
-      ? { reels: ["🍋", "🍊", "🍒"], payline: "NONE", colMult: 1 }
-      : (multiplier >= 25.0 ? { reels: ["🎰", "🎰", "🎰"], payline: "JACKPOT", colMult: 5 } : { reels: ["🔔", "🔔", "🔔"], payline: "BELLS", colMult: 3 });
-  }
+    const wager = parseFloat(bet.bet_amount);
+    let winAmount = Math.round(Number(wager * mult) * 100) / 100;
+    if (winAmount > CONFIG.MAX_PAYOUT) winAmount = CONFIG.MAX_PAYOUT;
 
-  if (gameName === "AviaMasters") {
-    return { safeLanding: !isLoss, targetMultiplier: multiplier };
-  }
+    // አሸናፊውን ገንዘብ ለተጠቃሚው መጨመር
+    let uRes = await client.query("SELECT balance FROM users WHERE user_id = $1 FOR UPDATE", [cleanId]);
+    const currentBal = parseFloat(uRes.rows[0].balance);
+    const newBal = Math.round(Number(currentBal + winAmount) * 100) / 100;
 
-  return {};
-}
+    await client.query("UPDATE users SET balance = $1, total_won = total_won + $2 WHERE user_id = $3", [newBal, winAmount, cleanId]);
+    await client.query("UPDATE universal_bets SET status = 'WON', payout = $1, multiplier = $2 WHERE bet_id = $3", [winAmount, mult, betId]);
+    await client.query("UPDATE casino_vault SET total_payouts = total_payouts + $1, vault_balance = vault_balance - $1 WHERE id = 1", [winAmount, winAmount]);
+
+    await recordAuditLog(client, cleanId, 'CASHOUT_WIN', winAmount, currentBal, newBal, betId);
+    await client.query('COMMIT');
+
+    return res.json({ success: true, winAmount, newBalance: newBal });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// አውሮፕላኑ ሲከሰከስ (ተጫዋቹ ካሽ አውት ሳያደርግ ሲቀር)
+app.post('/api/bet/crash', async (req, res) => {
+  const { betId } = req.body;
+  try {
+    // ገንዘቡ ገና ከመጀመሪያው በ takeoff ጊዜ ስለተቆረጠ፤ እዚህ ጋር ስታተሱን ብቻ LOST እናደርገዋለን!
+    await pool.query("UPDATE universal_bets SET status = 'LOST' WHERE bet_id = $1 AND status = 'IN_FLIGHT'", [betId]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ============================================================================
 // 💳 3. CASHIER DEPOSITS & WITHDRAWALS WITH 100% AML TURNOVER
