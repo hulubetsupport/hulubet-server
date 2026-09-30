@@ -43,11 +43,13 @@ pool.on('error', e => console.error('pg idle client error:', e.message));
 const CONFIG = {
   TARGET_RTP: 0.85, AGENT_COMMISSION: 0.02, WELCOME_BONUS: 20, REFERRAL_BONUS: 50,
   MIN_FIRST_DEP: 50, WAGER_REQ_MULT: 3, MIN_DEP: 50, MAX_DEP: 100000, MIN_WTH: 100, MAX_WTH: 50000,
-  MIN_BET: 1, MAX_BET: 1000, MAX_PAYOUT: 20000, SAFETY_BUFFER: 50000, MAX_CRASH: 100
+  MIN_BET: 1, MAX_BET: 1000, MAX_PAYOUT: 20000, SAFETY_BUFFER: 50000, MAX_CRASH: 100,
+  DAILY_WTH_LIMIT: 100000, MAX_PENDING_WTH: 2, REVIEW_AMOUNT: 10000, DEP_EXPIRE_HOURS: 24
 };
 const AGENTS = ['Agent1hulubet', 'Agent2hulubet'];
 const CRASH_GAMES = ['Aviator', 'JetX'];
 const INSTANT_GAMES = ['KenoFast', 'ChickenRoad2', 'Slot777', 'AviaMasters'];
+const PAY_METHODS = ['Telebirr', 'CBE'];
 
 // <PURE>
 const r2 = n => Math.round(Number(n) * 100) / 100;
@@ -279,6 +281,16 @@ async function loadSettings() {
   console.log(`Settings: RTP=${CONFIG.TARGET_RTP * 100}% commission=${CONFIG.AGENT_COMMISSION * 100}%`);
 }
 
+// Telegram notifications (player gets a message when a request is approved/rejected; admin chat gets new requests)
+async function notify(chatId, text) {
+  if (typeof fetch !== 'function' || !/^\d+$/.test(String(chatId || ''))) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${ENV.BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text }) });
+  } catch (e) { console.warn('notify failed:', e.message); }
+}
+const notifyAdmins = text => ENV.ADMIN_CHAT_ID ? notify(ENV.ADMIN_CHAT_ID, text) : null;
+const fmt = n => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
 // ---------------------------------------------------------------- public
 app.get('/', (_q, res) => res.send('Hulu Bet core is running'));
 app.get('/api/ping', (_q, res) => res.json({ status: 'OK', timestamp: Date.now() }));
@@ -376,7 +388,7 @@ app.post('/api/crash/bet', limit('crash', 120, 60e3), userAuth, h(async (req, re
   const out = await tx(async c => {
     const user = await lockUser(c, uid), bal = num(user.balance);
     if (bal < total) throw new Biz('Insufficient balance');
-    const open = await c.query(`SELECT COUNT(*) n FROM universal_bets WHERE user_id=$1 AND status='IN_FLIGHT'`, [uid]);
+    const open = await c.query(`SELECT COUNT(*) n FROM universal_bets WHERE user_id=$1 AND status='IN_FLIGHT' AND flight_start > NOW() - INTERVAL '6 minutes'`, [uid]);
     if (Number(open.rows[0].n) >= 4) throw new Biz('Finish your open rounds first');
     const roundId = newId('RND'), seed = crypto.randomBytes(32).toString('hex'), commit = crypto.createHash('sha256').update(seed).digest('hex');
     const cp = crashPointFromSeed(seed, roundId, CONFIG.TARGET_RTP, CONFIG.MAX_CRASH), newBal = r2(bal - total);
@@ -448,8 +460,18 @@ app.post('/api/crash/cashout', limit('cashout', 120, 60e3), userAuth, settleRout
 app.get('/api/crash/status', limit('status', 600, 60e3), userAuth, settleRoute(false));
 
 // Safety net: settle rounds whose player disappeared (max flight is ~4 minutes)
+async function expireDeposits() {
+  const r = await pool.query(`UPDATE transactions SET status='EXPIRED',remarks='Expired: not confirmed in time',updated_at=NOW() WHERE type='DEPOSIT' AND status='PENDING' AND created_at < NOW() - ($1 || ' hours')::interval`, [String(CONFIG.DEP_EXPIRE_HOURS)]);
+  if (r.rowCount) console.log(`Expired ${r.rowCount} stale deposit requests`);
+}
+async function closeLegacyRounds() {
+  const r = await pool.query(`UPDATE universal_bets SET status='LOST',house_profit=bet_amount WHERE status='IN_FLIGHT' AND flight_start IS NULL`);
+  if (r.rowCount) console.log(`Closed ${r.rowCount} legacy stuck rounds`);
+}
 setInterval(async () => {
   try {
+    await closeLegacyRounds();
+    await expireDeposits();
     const r = await pool.query(`SELECT bet_id,user_id FROM universal_bets WHERE status='IN_FLIGHT' AND game_name=ANY($1) AND flight_start < NOW() - INTERVAL '5 minutes' LIMIT 100`, [CRASH_GAMES]);
     for (const b of r.rows) await tx(c => resolveCrash(c, b.bet_id, b.user_id, {})).catch(e => console.error('sweep', e.message));
   } catch (e) { console.error('sweeper:', e.message); }
@@ -457,21 +479,51 @@ setInterval(async () => {
 
 // ---------------------------------------------------------------- 3. cashier
 app.post('/api/cashier/deposit', limit('dep', 20, 60e3), userAuth, h(async (req, res) => {
-  const amt = r2(req.body.amount), method = String(req.body.method || 'Telebirr').slice(0, 30);
+  const amt = r2(req.body.amount), method = PAY_METHODS.includes(req.body.method) ? req.body.method : 'Telebirr';
   const agent = AGENTS.includes(req.body.agentAssigned) ? req.body.agentAssigned : AGENTS[0];
+  const ref = String(req.body.bankRef || '').trim() || null;
   if (!(amt >= CONFIG.MIN_DEP && amt <= CONFIG.MAX_DEP)) throw new Biz(`Deposit must be between ${CONFIG.MIN_DEP} and ${CONFIG.MAX_DEP} ETB`);
+  if (ref && !/^[A-Za-z0-9]{6,30}$/.test(ref)) throw new Biz('Payment reference must be 6-30 letters/numbers');
   const u = await pool.query('SELECT status FROM users WHERE user_id=$1', [req.tg.id]);
   if (!u.rows.length) throw new Biz('User not found', 404);
+  if (['banned', 'suspended'].includes(String(u.rows[0].status).toLowerCase())) throw new Biz('Account is restricted. Contact support.', 403);
   const p = await pool.query(`SELECT COUNT(*) n FROM transactions WHERE user_id=$1 AND type='DEPOSIT' AND status='PENDING'`, [req.tg.id]);
-  if (Number(p.rows[0].n) >= 5) throw new Biz('You have too many pending deposits. Wait for the cashier.');
+  if (Number(p.rows[0].n) >= 5) throw new Biz('You have too many pending deposits. Wait for the cashier or cancel one.');
   const id = newId('DEP');
-  await pool.query(`INSERT INTO transactions (txn_id,user_id,username,type,method,amount,net_amount,agent_assigned,status,remarks)
-    VALUES ($1,$2,$3,'DEPOSIT',$4,$5,$5,$6,'PENDING','Pending cashier verification')`, [id, req.tg.id, req.tg.username || 'player', method, amt, agent]);
+  await pool.query(`INSERT INTO transactions (txn_id,user_id,username,type,method,amount,net_amount,agent_assigned,bank_txn_id,status,remarks)
+    VALUES ($1,$2,$3,'DEPOSIT',$4,$5,$5,$6,$7,'PENDING','Pending cashier verification')`, [id, req.tg.id, req.tg.username || 'player', method, amt, agent, ref]); // reused reference -> 409
+  notifyAdmins(`📥 New deposit ${id}\n${fmt(amt)} ETB via ${method}\nPlayer: @${req.tg.username || '-'} (${req.tg.id})${ref ? '\nRef: ' + ref : ''}`);
   res.json({ success: true, txnId: id, agent });
 }));
 
+// Player cancels his own PENDING request (a cancelled withdrawal is refunded)
+app.post('/api/cashier/cancel', limit('cancel', 20, 60e3), userAuth, h(async (req, res) => {
+  const id = String(req.body.txnId || '');
+  const out = await tx(async c => {
+    const t = (await c.query(`SELECT * FROM transactions WHERE txn_id=$1 AND user_id=$2 AND type IN ('DEPOSIT','WITHDRAWAL') AND status='PENDING' FOR UPDATE`, [id, req.tg.id])).rows[0];
+    if (!t) throw new Biz('Request not found or already processed');
+    let newBal = null;
+    if (t.type === 'WITHDRAWAL') {
+      const u = await lockUser(c, req.tg.id), before = num(u.balance), amt = num(t.amount);
+      newBal = r2(before + amt);
+      await c.query('UPDATE users SET balance=$1 WHERE user_id=$2', [newBal, req.tg.id]);
+      await audit(c, req.tg.id, 'WITHDRAWAL_CANCEL', amt, before, newBal, id);
+    }
+    await c.query(`UPDATE transactions SET status='CANCELLED',remarks='Cancelled by player',updated_at=NOW() WHERE txn_id=$1`, [id]);
+    return { type: t.type, newBal };
+  });
+  res.json({ success: true, type: out.type, newBalance: out.newBal, message: out.type === 'WITHDRAWAL' ? 'Withdrawal cancelled and refunded' : 'Deposit request cancelled' });
+}));
+
+app.get('/api/cashier/history', limit('hist', 60, 60e3), userAuth, h(async (req, res) => {
+  const r = await pool.query(`SELECT txn_id,type,method,amount,status,remarks,created_at FROM transactions
+    WHERE user_id=$1 AND type IN ('DEPOSIT','WITHDRAWAL') ORDER BY created_at DESC LIMIT 30`, [req.tg.id]);
+  res.json({ success: true, items: r.rows.map(t => ({ id: t.txn_id, type: t.type, method: t.method, amount: num(t.amount),
+    status: String(t.status).toLowerCase(), note: String(t.status).toUpperCase() === 'REJECTED' ? (t.remarks || '') : '', at: t.created_at })) });
+}));
+
 app.post('/api/cashier/withdraw', limit('wd', 10, 60e3), userAuth, h(async (req, res) => {
-  const amt = r2(req.body.amount), acc = String(req.body.accountNumber || '').trim(), method = String(req.body.method || 'Telebirr').slice(0, 30);
+  const amt = r2(req.body.amount), acc = String(req.body.accountNumber || '').trim(), method = PAY_METHODS.includes(req.body.method) ? req.body.method : 'Telebirr';
   if (!(amt >= CONFIG.MIN_WTH && amt <= CONFIG.MAX_WTH)) throw new Biz(`Withdrawal must be between ${CONFIG.MIN_WTH} and ${CONFIG.MAX_WTH} ETB`);
   if (!/^[0-9+\-\s]{8,20}$/.test(acc)) throw new Biz('Enter a valid phone / account number');
   const out = await tx(async c => {
@@ -480,15 +532,23 @@ app.post('/api/cashier/withdraw', limit('wd', 10, 60e3), userAuth, h(async (req,
     if (u.first_deposit_completed !== 'YES' && num(u.total_deposited) < CONFIG.MIN_FIRST_DEP) throw new Biz(`Deposit at least ${CONFIG.MIN_FIRST_DEP} ETB first to unlock withdrawals`);
     if (num(u.wager_requirement_left) > 0) throw new Biz(`Bonus wagering active: ${num(u.wager_requirement_left).toFixed(2)} ETB left to wager`);
     if (num(u.total_wagered) < num(u.total_deposited)) throw new Biz(`Turnover rule: wager ${r2(num(u.total_deposited) - num(u.total_wagered)).toFixed(2)} ETB more before withdrawing`);
-    const inflight = await c.query(`SELECT 1 FROM universal_bets WHERE user_id=$1 AND status='IN_FLIGHT' LIMIT 1`, [req.tg.id]);
+    const inflight = await c.query(`SELECT 1 FROM universal_bets WHERE user_id=$1 AND status='IN_FLIGHT' AND flight_start > NOW() - INTERVAL '6 minutes' LIMIT 1`, [req.tg.id]);
     if (inflight.rows.length) throw new Biz('Finish your running game round first');
+    const pend = await c.query(`SELECT COUNT(*) n FROM transactions WHERE user_id=$1 AND type='WITHDRAWAL' AND status='PENDING'`, [req.tg.id]);
+    if (Number(pend.rows[0].n) >= CONFIG.MAX_PENDING_WTH) throw new Biz('You already have a pending withdrawal. Wait for it or cancel it.');
+    const day = await c.query(`SELECT COALESCE(SUM(amount),0) s,COUNT(*) n FROM transactions WHERE user_id=$1 AND type='WITHDRAWAL' AND status IN ('PENDING','APPROVED') AND created_at>=NOW()-INTERVAL '24 hours'`, [req.tg.id]);
+    if (num(day.rows[0].s) + amt > CONFIG.DAILY_WTH_LIMIT) throw new Biz(`Daily withdrawal limit is ${CONFIG.DAILY_WTH_LIMIT} ETB`);
+    const prior = await c.query(`SELECT COUNT(*) n FROM transactions WHERE user_id=$1 AND type='WITHDRAWAL' AND status='APPROVED'`, [req.tg.id]);
+    const flags = [Number(prior.rows[0].n) === 0 ? 'FIRST WITHDRAWAL' : '', amt >= CONFIG.REVIEW_AMOUNT ? 'LARGE AMOUNT' : ''].filter(Boolean);
+    const note = 'Awaiting admin payout' + (flags.length ? ' | REVIEW: ' + flags.join(', ') : '');
     const newBal = r2(bal - amt), id = newId('WTH');
     await c.query('UPDATE users SET balance=$1 WHERE user_id=$2', [newBal, req.tg.id]);
     await c.query(`INSERT INTO transactions (txn_id,user_id,username,type,method,amount,net_amount,sender_account,status,remarks)
-      VALUES ($1,$2,$3,'WITHDRAWAL',$4,$5,$5,$6,'PENDING','Awaiting admin payout')`, [id, req.tg.id, u.telegram_username, method, amt, acc]);
+      VALUES ($1,$2,$3,'WITHDRAWAL',$4,$5,$5,$6,'PENDING',$7)`, [id, req.tg.id, u.telegram_username, method, amt, acc, note]);
     await audit(c, req.tg.id, 'WITHDRAWAL_HOLD', amt, bal, newBal, id);
-    return { id, newBal };
+    return { id, newBal, note, uname: u.telegram_username };
   });
+  notifyAdmins(`💸 New withdrawal ${out.id}\n${fmt(amt)} ETB via ${method} to ${acc}\nPlayer: @${out.uname || '-'} (${req.tg.id})${out.note.includes('REVIEW') ? '\n⚠️ ' + out.note.split('| ')[1] : ''}`);
   res.json({ success: true, txnId: out.id, newBalance: out.newBal });
 }));
 
@@ -545,11 +605,9 @@ const dashboard = h(async (_req, res) => {
               COALESCE(SUM(house_profit) FILTER (WHERE created_at>=date_trunc('month',NOW())),0) m FROM universal_bets WHERE status IN ('WON','LOST')`),
     q(`SELECT game_name,COUNT(*) bets,COALESCE(SUM(bet_amount),0) wagered,COALESCE(SUM(payout),0) paid FROM universal_bets WHERE status IN ('WON','LOST') GROUP BY game_name`)
   ]);
-  const v = vault.rows[0] || {}, fu = u => ({
-    ...userRow(u)
-  });
+  const v = vault.rows[0] || {};
   const bonusM = await q(`SELECT COALESCE(SUM(amount),0) s FROM transactions WHERE type='BONUS' AND created_at>=date_trunc('month',NOW())`).catch(() => ({ rows: [{ s: 0 }] }));
-  const usersList = users.rows.map(fu);
+  const usersList = users.rows.map(userRow);
   res.json({
     success: true,
     vault: { gross_profit: num(v.gross_profit), vault_balance: num(v.vault_balance), total_wagered: num(v.total_wagered), ggrToday: num(ggr.rows[0].d), ngrMonth: r2(num(ggr.rows[0].m) - num(bonusM.rows[0].s)), vaultBalance: num(v.vault_balance), totalWagered: num(v.total_wagered) },
@@ -584,6 +642,7 @@ app.get('/api/admin/audit', admin, h(async (_q, res) => {
 
 app.post('/api/admin/approve-deposit', admin, h(async (req, res) => {
   const txnId = String(req.body.txnId || ''); if (!txnId) throw new Biz('Transaction ID required');
+  const bankRef = String(req.body.bankRef || '').trim().slice(0, 40) || null;   // bank/Telebirr reference: a reused one is rejected (409)
   const out = await tx(async c => {
     const t = (await c.query(`SELECT * FROM transactions WHERE txn_id=$1 AND type='DEPOSIT' AND status='PENDING' FOR UPDATE`, [txnId])).rows[0];
     if (!t) throw new Biz('Deposit already processed or not found');
@@ -592,25 +651,31 @@ app.post('/api/admin/approve-deposit', admin, h(async (req, res) => {
     const before = num(u.balance), after = r2(before + amt), first = u.first_deposit_completed !== 'YES';
     await c.query(`UPDATE users SET balance=$1,total_deposited=total_deposited+$2,first_deposit_completed='YES' WHERE user_id=$3`, [after, amt, t.user_id]);
     await payAgent(c, t.agent_assigned || req.actor, amt);
-    await c.query(`UPDATE transactions SET status='APPROVED',remarks=$1,processed_by=$2,updated_at=NOW() WHERE txn_id=$3`, [`Approved by ${req.actor}`, req.actor, txnId]);
+    await c.query(`UPDATE transactions SET status='APPROVED',remarks=$1,processed_by=$2,bank_txn_id=COALESCE($4,bank_txn_id),updated_at=NOW() WHERE txn_id=$3`, [`Approved by ${req.actor}`, req.actor, txnId, bankRef]);
     await audit(c, t.user_id, 'DEPOSIT_APPROVE', amt, before, after, txnId);
     if (first && amt >= CONFIG.MIN_FIRST_DEP) await creditReferral(c, t.user_id);
     return { amt, uid: t.user_id };
   });
   alog(req, 'approve-deposit', `${txnId} ${out.amt} -> ${out.uid}`);
+  notify(out.uid, `✅ Your deposit of ${fmt(out.amt)} ETB was approved. Good luck! 🦁`);
   res.json({ success: true, message: `Deposit ${txnId} approved (+${out.amt} ETB to ${out.uid})` });
 }));
 app.post('/api/admin/reject-deposit', admin, h(async (req, res) => {
-  const r = await pool.query(`UPDATE transactions SET status='REJECTED',remarks=$1,processed_by=$2,updated_at=NOW() WHERE txn_id=$3 AND type='DEPOSIT' AND status='PENDING'`,
-    [String(req.body.reason || 'Payment verification failed').slice(0, 200), req.actor, String(req.body.txnId || '')]);
+  const reason = String(req.body.reason || 'Payment verification failed').slice(0, 200);
+  const r = await pool.query(`UPDATE transactions SET status='REJECTED',remarks=$1,processed_by=$2,updated_at=NOW() WHERE txn_id=$3 AND type='DEPOSIT' AND status='PENDING' RETURNING user_id,amount`,
+    [reason, req.actor, String(req.body.txnId || '')]);
   if (!r.rowCount) throw new Biz('Deposit already processed or not found');
-  alog(req, 'reject-deposit', req.body.txnId); res.json({ success: true, message: `Deposit ${req.body.txnId} rejected` });
+  alog(req, 'reject-deposit', req.body.txnId);
+  notify(r.rows[0].user_id, `❌ Your deposit of ${fmt(r.rows[0].amount)} ETB was rejected.\nReason: ${reason}`);
+  res.json({ success: true, message: `Deposit ${req.body.txnId} rejected` });
 }));
 app.post('/api/admin/approve-withdrawal', admin, h(async (req, res) => {
-  const r = await pool.query(`UPDATE transactions SET status='APPROVED',remarks=$1,processed_by=$2,updated_at=NOW() WHERE txn_id=$3 AND type='WITHDRAWAL' AND status='PENDING'`,
+  const r = await pool.query(`UPDATE transactions SET status='APPROVED',remarks=$1,processed_by=$2,updated_at=NOW() WHERE txn_id=$3 AND type='WITHDRAWAL' AND status='PENDING' RETURNING user_id,amount,method`,
     [`Payout completed by ${req.actor}`, req.actor, String(req.body.txnId || '')]);
   if (!r.rowCount) throw new Biz('Withdrawal already processed or not found');
-  alog(req, 'approve-withdrawal', req.body.txnId); res.json({ success: true, message: `Withdrawal ${req.body.txnId} marked completed` });
+  alog(req, 'approve-withdrawal', req.body.txnId);
+  notify(r.rows[0].user_id, `✅ Your withdrawal of ${fmt(r.rows[0].amount)} ETB was paid out via ${r.rows[0].method}.`);
+  res.json({ success: true, message: `Withdrawal ${req.body.txnId} marked completed` });
 }));
 app.post('/api/admin/reject-withdrawal', admin, h(async (req, res) => {
   const txnId = String(req.body.txnId || '');
@@ -625,6 +690,7 @@ app.post('/api/admin/reject-withdrawal', admin, h(async (req, res) => {
     return { amt, uid: t.user_id };
   });
   alog(req, 'reject-withdrawal', `${txnId} refund ${out.amt}`);
+  notify(out.uid, `❌ Your withdrawal of ${fmt(out.amt)} ETB was rejected and the money was returned to your balance.`);
   res.json({ success: true, message: `Withdrawal ${txnId} rejected, ${out.amt} ETB refunded to ${out.uid}` });
 }));
 
@@ -732,4 +798,4 @@ app.post('/api/admin/user-status', admin, h(async (req, res) => {
 
 process.on('unhandledRejection', e => console.error('unhandledRejection:', e));
 const PORT = ENV.PORT || 3000;
-ensureSchema().then(loadSettings).finally(() => server.listen(PORT, () => console.log(`Hulu Bet server on :${PORT}`)));
+ensureSchema().then(closeLegacyRounds).then(loadSettings).finally(() => server.listen(PORT, () => console.log(`Hulu Bet server on :${PORT}`)));
